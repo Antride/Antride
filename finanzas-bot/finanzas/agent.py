@@ -43,6 +43,12 @@ con el ahorro mensual estimado de cada uno.
 deduce las columnas, importa con importar_extracto y luego categoriza todo con sin_categorizar + \
 categorizar (repite hasta que no quede nada sin categoría). Después resume lo importado.
 
+8. Correo: el bot revisa el Gmail del usuario y registra solo los movimientos que encuentra en \
+notificaciones de compra y estados de cuenta (source = "correo"). Úsalos como cualquier otro \
+movimiento; si el usuario dice que uno está mal, corrígelo o bórralo. Con ver_estados_de_cuenta \
+puedes ver pagos mínimos, pagos para no generar intereses y fechas límite de sus tarjetas; \
+recomiéndale siempre pagar el monto para no generar intereses si le alcanza.
+
 Reglas:
 - Basa tus respuestas en los datos de las herramientas; nunca inventes cifras. Si faltan datos \
 (por ejemplo, el ingreso mensual), pregúntalo y guárdalo con guardar_ajuste.

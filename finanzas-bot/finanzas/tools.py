@@ -211,6 +211,12 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "ver_estados_de_cuenta",
+        "description": ("Lista los estados de cuenta de tarjetas leídos del correo: saldo, pago "
+                        "mínimo, pago para no generar intereses y fecha límite de pago."),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "sin_categorizar",
         "description": "Lista movimientos que aún no tienen categoría.",
         "input_schema": {"type": "object", "properties": {"limite": {"type": "integer"}}},
@@ -253,20 +259,21 @@ def _upload_path(ctx: ToolContext, file_id: str) -> Path:
     return matches[0]
 
 
-def _budget_alerts(ctx: ToolContext) -> list[dict]:
-    """Devuelve (y marca como enviadas) las alertas nuevas de presupuesto."""
-    today = ctx.today()
-    out = []
+def budget_alerts(db: FinanceDB, today: date) -> list[dict]:
+    """Devuelve (y marca como enviadas) las alertas nuevas de presupuesto: la más alta
+    por categoría."""
     by_cat: dict[str, dict] = {}
-    for a in ctx.db.pending_alerts(today):
+    for a in db.pending_alerts(today):
         prev = by_cat.get(a["categoria"])
         if not prev or a["umbral"] > prev["umbral"]:
             by_cat[a["categoria"]] = a
-        ctx.db.mark_alert_sent(today.strftime("%Y-%m"), a["categoria"], a["umbral"])
-    for a in by_cat.values():
-        out.append({k: a[k] for k in ("categoria", "umbral", "gastado", "presupuesto",
-                                      "restante", "ritmo")})
-    return out
+        db.mark_alert_sent(today.strftime("%Y-%m"), a["categoria"], a["umbral"])
+    return [{k: a[k] for k in ("categoria", "umbral", "gastado", "presupuesto", "usado_pct",
+                               "restante", "ritmo")} for a in by_cat.values()]
+
+
+def _budget_alerts(ctx: ToolContext) -> list[dict]:
+    return budget_alerts(ctx.db, ctx.today())
 
 
 def run_tool(ctx: ToolContext, name: str, args: dict) -> str:
@@ -370,6 +377,9 @@ def run_tool(ctx: ToolContext, name: str, args: dict) -> str:
             "rango_fechas": [min((t["date"] for t in txs), default=None),
                              max((t["date"] for t in txs), default=None)],
         })
+
+    if name == "ver_estados_de_cuenta":
+        return _json({"estados_de_cuenta": db.statements()})
 
     if name == "sin_categorizar":
         rows = db.uncategorized(min(int(args.get("limite", 100)), 200))

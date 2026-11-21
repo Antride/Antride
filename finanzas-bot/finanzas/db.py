@@ -40,6 +40,29 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 
+-- Correos ya revisados (para no procesarlos dos veces).
+CREATE TABLE IF NOT EXISTS processed_emails (
+    message_id   TEXT PRIMARY KEY,
+    processed_at TEXT NOT NULL,
+    kind         TEXT NOT NULL,             -- notificacion | estado_de_cuenta | otro | error
+    sender       TEXT NOT NULL DEFAULT '',
+    subject      TEXT NOT NULL DEFAULT ''
+);
+
+-- Estados de cuenta de tarjetas: para recordar fechas límite de pago.
+CREATE TABLE IF NOT EXISTS statements (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    institution          TEXT NOT NULL,
+    account              TEXT NOT NULL DEFAULT '',   -- p. ej. "terminación 1234"
+    period_end           TEXT,
+    due_date             TEXT,
+    balance              REAL,
+    minimum_payment      REAL,
+    no_interest_payment  REAL,
+    message_id           TEXT UNIQUE,
+    reminded             INTEGER NOT NULL DEFAULT 0
+);
+
 -- Para no repetir la misma alerta varias veces en un mes.
 CREATE TABLE IF NOT EXISTS alerts_sent (
     month     TEXT NOT NULL,               -- YYYY-MM
@@ -411,6 +434,72 @@ class FinanceDB:
                 for r in biggest
             ],
         }
+
+    # ------------------------------------------------------------------ correo
+    def find_similar(self, tx_date: str, amount: float, kind: str, days: int = 3,
+                     exclude: set[int] | None = None) -> dict | None:
+        """Busca un movimiento con el mismo monto en ±days días (p. ej. la notificación de
+        una compra que luego aparece en el estado de cuenta)."""
+        d = date.fromisoformat(tx_date)
+        rows = self._conn.execute(
+            "SELECT * FROM transactions WHERE kind = ? AND ABS(amount - ?) < 0.005"
+            " AND date BETWEEN ? AND ? ORDER BY ABS(julianday(date) - julianday(?))",
+            (kind, round(abs(amount), 2), (d - timedelta(days=days)).isoformat(),
+             (d + timedelta(days=days)).isoformat(), tx_date),
+        )
+        for r in rows:
+            if not exclude or r["id"] not in exclude:
+                return dict(r)
+        return None
+
+    def is_email_processed(self, message_id: str) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM processed_emails WHERE message_id = ?", (message_id,)
+        ).fetchone() is not None
+
+    def mark_email_processed(self, message_id: str, kind: str, sender: str = "",
+                             subject: str = "", when: str | None = None) -> None:
+        with self._tx() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO processed_emails VALUES (?, ?, ?, ?, ?)",
+                (message_id, when or date.today().isoformat(), kind, sender[:200], subject[:300]),
+            )
+
+    def email_stats(self) -> dict:
+        rows = self._conn.execute("SELECT kind, COUNT(*) FROM processed_emails GROUP BY kind")
+        return {r[0]: r[1] for r in rows}
+
+    def add_statement(self, institution: str, account: str, period_end: str | None,
+                      due_date: str | None, balance: float | None, minimum_payment: float | None,
+                      no_interest_payment: float | None, message_id: str) -> None:
+        with self._tx() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO statements (institution, account, period_end, due_date,"
+                " balance, minimum_payment, no_interest_payment, message_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (institution, account, period_end, due_date, balance, minimum_payment,
+                 no_interest_payment, message_id),
+            )
+
+    def statements(self, limit: int = 20) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM statements ORDER BY COALESCE(due_date, period_end) DESC LIMIT ?",
+            (limit,))
+        return [dict(r) for r in rows]
+
+    def due_payment_reminders(self, today: date, days_ahead: int = 3) -> list[dict]:
+        """Estados de cuenta cuya fecha límite de pago está a <= days_ahead días y no se han
+        recordado todavía."""
+        rows = self._conn.execute(
+            "SELECT * FROM statements WHERE reminded = 0 AND due_date IS NOT NULL"
+            " AND due_date BETWEEN ? AND ?",
+            (today.isoformat(), (today + timedelta(days=days_ahead)).isoformat()),
+        )
+        return [dict(r) for r in rows]
+
+    def mark_statement_reminded(self, statement_id: int) -> None:
+        with self._tx() as c:
+            c.execute("UPDATE statements SET reminded = 1 WHERE id = ?", (statement_id,))
 
     # ------------------------------------------------------------------ alertas
     def pending_alerts(self, today: date) -> list[dict]:
