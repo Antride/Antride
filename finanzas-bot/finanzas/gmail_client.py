@@ -102,6 +102,8 @@ def unlock_pdf(data: bytes, passwords: list[str]) -> bytes | None:
 
 
 class GmailClient:
+    name = "gmail"
+
     def __init__(self, credentials_path: Path, token_path: Path):
         self.credentials_path = credentials_path
         self.token_path = token_path
@@ -138,6 +140,10 @@ class GmailClient:
                 self.token_path.write_text(creds.to_json())
             self._service = build("gmail", "v1", credentials=creds, cache_discovery=False)
         return self._service
+
+    def find_new(self, lookback_days: int, query: str | None, max_results: int) -> list[str]:
+        """Ids de correos recientes que parecen financieros (más nuevos primero)."""
+        return self.search(f"({query or DEFAULT_QUERY}) newer_than:{lookback_days}d", max_results)
 
     def search(self, query: str, max_results: int = 50) -> list[str]:
         resp = self._svc().users().messages().list(

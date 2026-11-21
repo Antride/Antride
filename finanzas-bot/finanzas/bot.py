@@ -20,6 +20,7 @@ from .config import Config
 from .db import FinanceDB, TOTAL, prev_month
 from .email_sync import SyncEvent, sync_mailbox
 from .gmail_client import GmailClient
+from .outlook_client import OutlookClient
 from .tools import ToolContext, budget_alerts
 
 log = logging.getLogger(__name__)
@@ -43,10 +44,10 @@ Comandos:
 /analisis – a dónde se va tu dinero
 /plan – plan para acomodar tus finanzas
 /metas – tus metas de ahorro
-/correo – revisar tu Gmail ahora (compras y estados de cuenta)
+/correo – revisar tu correo ahora (Gmail / Outlook)
 /nuevo – empezar una conversación nueva (tus datos se conservan)
 
-Si conectaste tu Gmail, reviso tu correo cada rato y te aviso de cada compra que detecte en \
+Si conectaste tu Gmail o tu Outlook, reviso tu correo cada rato y te aviso de cada compra que detecte en \
 las notificaciones del banco y en tus estados de cuenta. También te recuerdo la fecha límite de \
 pago de tus tarjetas. Cada día te aviso si te acercas a un presupuesto, cada lunes te mando cómo \
 vas y el día 1 te mando el resumen del mes anterior."""
@@ -60,9 +61,20 @@ def build_app(cfg: Config) -> Application:
     agent = FinanceAgent(ctx, cfg.currency)
 
     app = Application.builder().token(cfg.telegram_token).build()
+    # Buzones vinculados: (fuente, búsqueda personalizada)
+    sources = []
     gmail = GmailClient(cfg.gmail_credentials, cfg.gmail_token)
-    app.bot_data.update(cfg=cfg, db=db, ctx=ctx, agent=agent,
-                        gmail=gmail if gmail.is_linked else None, email_lock=asyncio.Lock())
+    if gmail.is_linked:
+        sources.append((gmail, cfg.gmail_query))
+    else:
+        log.info("Gmail no vinculado: ejecuta 'python main.py --vincular-gmail' para activarlo.")
+    outlook = OutlookClient(cfg.outlook_client_id, cfg.outlook_tenant, cfg.outlook_token)
+    if outlook.is_linked:
+        sources.append((outlook, cfg.outlook_keywords))
+    else:
+        log.info("Outlook no vinculado: ejecuta 'python main.py --vincular-outlook' para activarlo.")
+    app.bot_data.update(cfg=cfg, db=db, ctx=ctx, agent=agent, mail_sources=sources,
+                        email_lock=asyncio.Lock())
 
     allowed = filters.User(user_id=list(cfg.allowed_user_ids)) if cfg.allowed_user_ids else None
 
@@ -92,11 +104,9 @@ def build_app(cfg: Config) -> Application:
     jq.run_daily(job_weekly_status, time(hour=9, minute=7, tzinfo=tz), days=(1,), name="semanal")
     jq.run_daily(job_monthly_report, time(hour=9, minute=13, tzinfo=tz), name="mensual")
     jq.run_daily(job_payment_reminders, time(hour=10, minute=3, tzinfo=tz), name="pagos")
-    if gmail.is_linked:
+    if sources:
         jq.run_repeating(job_check_email, interval=cfg.gmail_interval_minutes * 60, first=20,
                          name="correo")
-    else:
-        log.info("Gmail no vinculado: ejecuta 'python main.py --vincular-gmail' para activarlo.")
     return app
 
 
@@ -258,8 +268,9 @@ def format_sync_events(events: list[SyncEvent], currency: str) -> list[str]:
     msgs = []
     for ev in events:
         src = ev.institution or ev.email.sender
+        box = " (Outlook)" if ev.email.id.startswith("outlook:") else ""
         if ev.kind == "estado_de_cuenta":
-            lines = [f"🧾 *Estado de cuenta* de {src}"]
+            lines = [f"🧾 *Estado de cuenta* de {src}{box}"]
             st = ev.statement or {}
             if st.get("pago_para_no_generar_intereses") is not None:
                 lines.append(f"• Pago para no generar intereses: "
@@ -276,7 +287,7 @@ def format_sync_events(events: list[SyncEvent], currency: str) -> list[str]:
                 icon = "💳" if m["tipo"] == "gasto" else "💵"
                 verb = "Compra detectada" if m["tipo"] == "gasto" else "Ingreso detectado"
                 msgs.append(f"{icon} {verb}: *{m['monto']:,.2f} {currency}* · {m['comercio']} "
-                            f"({m['categoria']}) — {m['fecha']}\nSi está mal, dime "
+                            f"({m['categoria']}) — {m['fecha']}{box}\nSi está mal, dime "
                             f"\"corrige el movimiento {m['id']}\".")
     return msgs
 
@@ -284,16 +295,24 @@ def format_sync_events(events: list[SyncEvent], currency: str) -> list[str]:
 async def run_email_sync(context: ContextTypes.DEFAULT_TYPE, notify_empty_to: int | None = None):
     cfg: Config = context.bot_data["cfg"]
     db: FinanceDB = context.bot_data["db"]
-    gmail: GmailClient | None = context.bot_data["gmail"]
-    if gmail is None:
+    sources = context.bot_data["mail_sources"]
+    if not sources:
         return None
     lock: asyncio.Lock = context.bot_data["email_lock"]
     if lock.locked():
         return []
+    events: list[SyncEvent] = []
     async with lock:
         agent: FinanceAgent = context.bot_data["agent"]
-        events = await sync_mailbox(db, gmail, agent.client, list(cfg.pdf_passwords),
-                                    cfg.gmail_query, cfg.gmail_lookback_days)
+        for source, query in sources:
+            try:
+                events += await sync_mailbox(db, source, agent.client, list(cfg.pdf_passwords),
+                                             query, cfg.gmail_lookback_days)
+            except anthropic.APIError:
+                raise
+            except Exception:
+                # Un buzón con problemas (sesión expirada, red) no detiene a los demás.
+                log.exception("Error revisando %s", source.name)
     msgs = format_sync_events(events, cfg.currency)
     if len(msgs) > 15:  # p. ej. la primera revisión de 60 días: se resume
         n = sum(len(e.added) for e in events)
@@ -318,10 +337,11 @@ async def job_check_email(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if context.bot_data["gmail"] is None:
+    if not context.bot_data["mail_sources"]:
         await update.message.reply_text(
-            "Todavía no conectaste tu Gmail. En la computadora donde corre el bot ejecuta:\n"
-            "python main.py --vincular-gmail\n(ver README, sección 'Conectar Gmail').")
+            "Todavía no conectaste ningún correo. En la computadora donde corre el bot ejecuta:\n"
+            "python main.py --vincular-gmail\no\npython main.py --vincular-outlook\n"
+            "(ver README, secciones 'Conectar Gmail' y 'Conectar Outlook').")
         return
     await update.message.reply_text("📬 Revisando tu correo…")
     try:

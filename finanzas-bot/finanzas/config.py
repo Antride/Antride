@@ -21,6 +21,9 @@ class Config:
     gmail_interval_minutes: int
     gmail_lookback_days: int
     pdf_passwords: tuple[str, ...]
+    outlook_client_id: str
+    outlook_tenant: str
+    outlook_keywords: str | None
 
     @property
     def db_path(self) -> Path:
@@ -37,6 +40,10 @@ class Config:
     @property
     def gmail_token(self) -> Path:
         return self.data_dir / "gmail_token.json"
+
+    @property
+    def outlook_token(self) -> Path:
+        return self.data_dir / "outlook_token.json"
 
 
 def load_config(require_tokens: bool = True) -> Config:
@@ -60,4 +67,8 @@ def load_config(require_tokens: bool = True) -> Config:
         gmail_lookback_days=int(os.environ.get("GMAIL_LOOKBACK_DAYS", "60")),
         # Contraseñas para abrir estados de cuenta en PDF (p. ej. tu RFC), separadas por coma.
         pdf_passwords=tuple(p for p in os.environ.get("PDF_PASSWORDS", "").split(",") if p),
+        outlook_client_id=os.environ.get("OUTLOOK_CLIENT_ID", "").strip(),
+        # "common" = cuentas personales (outlook.com, hotmail) y de trabajo/escuela.
+        outlook_tenant=os.environ.get("OUTLOOK_TENANT", "common").strip() or "common",
+        outlook_keywords=os.environ.get("OUTLOOK_KEYWORDS") or None,
     )

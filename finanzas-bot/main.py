@@ -1,7 +1,8 @@
 """Punto de entrada.
 
     python main.py                  # arranca el bot
-    python main.py --vincular-gmail # autoriza (una sola vez) la lectura de tu Gmail
+    python main.py --vincular-gmail   # autoriza (una sola vez) la lectura de tu Gmail
+    python main.py --vincular-outlook # autoriza (una sola vez) la lectura de tu Outlook
 """
 
 import logging
@@ -20,6 +21,15 @@ def main() -> None:
         cfg = load_config(require_tokens=False)
         GmailClient(cfg.gmail_credentials, cfg.gmail_token).authorize_interactive()
         print(f"✅ Gmail vinculado (solo lectura). Token guardado en {cfg.gmail_token}.")
+        return
+
+    if "--vincular-outlook" in sys.argv:
+        from finanzas.outlook_client import OutlookClient
+
+        cfg = load_config(require_tokens=False)
+        OutlookClient(cfg.outlook_client_id, cfg.outlook_tenant,
+                      cfg.outlook_token).authorize_interactive()
+        print(f"✅ Outlook vinculado (solo lectura). Token guardado en {cfg.outlook_token}.")
         return
 
     from finanzas.bot import build_app

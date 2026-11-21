@@ -125,12 +125,14 @@ class _Obj:
 
 
 class FakeGmail:
+    name = "gmail"
+
     def __init__(self, emails):
         self.emails = {e.id: e for e in emails}
         self.queries = []
 
-    def search(self, q, max_results):
-        self.queries.append(q)
+    def find_new(self, lookback_days, query, max_results):
+        self.queries.append(f"newer_than:{lookback_days}d")
         return list(self.emails)
 
     def get(self, msg_id, passwords):
@@ -166,3 +168,99 @@ def test_sync_mailbox_processes_each_email_once(db):
     text = client.calls[0]["messages"][0]["content"][-1]["text"]
     assert text.startswith("<correo>") and text.endswith("</correo>")
     assert client.calls[0]["output_config"]["format"]["type"] == "json_schema"
+
+
+# ----------------------------------------------------------------------------- Outlook
+import base64
+
+from finanzas.outlook_client import ID_PREFIX, OutlookClient, looks_financial
+
+
+def test_looks_financial_ignores_accents_and_case():
+    assert looks_financial("Notificación de TRANSACCIÓN", "", "")
+    assert looks_financial("Hola", "BBVA <alertas@bbva.mx>", "Realizaste una compra por $200")
+    assert not looks_financial("Tu boletín semanal", "news@x.com", "Las mejores noticias")
+    assert looks_financial("Aviso", "", "", keywords=["aviso"])
+
+
+def _pdf_bytes(password=None):
+    from pypdf import PdfWriter
+
+    w = PdfWriter()
+    w.add_blank_page(100, 100)
+    if password:
+        w.encrypt(password)
+    buf = io.BytesIO()
+    w.write(buf)
+    return buf.getvalue()
+
+
+class FakeGraph(OutlookClient):
+    """OutlookClient con las llamadas HTTP simuladas."""
+
+    def __init__(self, responses):
+        super().__init__("client-id", "common", None)
+        self.responses = responses
+        self.requested = []
+
+    def _get(self, url, params=None):
+        self.requested.append((url, params))
+        return self.responses[url]
+
+
+def test_outlook_find_new_filters_and_paginates():
+    page2 = "https://graph.microsoft.com/v1.0/me/messages?$skiptoken=abc"
+    g = FakeGraph({
+        "/me/mailFolders/junkemail": {"id": "JUNK"},
+        "/me/mailFolders/deleteditems": {"id": "TRASH"},
+        "/me/messages": {"value": [
+            {"id": "1", "subject": "Compra aprobada", "from": {"emailAddress": {
+                "name": "Banorte", "address": "alertas@banorte.com"}},
+             "bodyPreview": "", "parentFolderId": "INBOX"},
+            {"id": "2", "subject": "Compra aprobada", "from": {"emailAddress": {}},
+             "bodyPreview": "", "parentFolderId": "JUNK"},
+            {"id": "3", "subject": "Reunión del viernes", "from": {"emailAddress": {}},
+             "bodyPreview": "Nos vemos", "parentFolderId": "INBOX"},
+        ], "@odata.nextLink": page2},
+        page2: {"value": [
+            {"id": "4", "subject": "Tu estado de cuenta", "from": {"emailAddress": {}},
+             "bodyPreview": "", "parentFolderId": "INBOX"},
+        ]},
+    })
+    ids = g.find_new(60, None, 50)
+    assert ids == [ID_PREFIX + "1", ID_PREFIX + "4"]
+    first_params = next(p for u, p in g.requested if u == "/me/messages")
+    assert first_params["$filter"].startswith("receivedDateTime ge ")
+
+
+def test_outlook_get_reads_html_and_locked_pdf():
+    g = FakeGraph({
+        "/me/messages/AAA": {
+            "subject": "Estado de cuenta", "receivedDateTime": "2026-11-20T15:00:00Z",
+            "from": {"emailAddress": {"name": "Banco", "address": "edocta@banco.mx"}},
+            "body": {"contentType": "html", "content": "<p>Saldo: <b>$5,000.00</b></p>"},
+            "hasAttachments": True},
+        "/me/messages/AAA/attachments": {"value": [
+            {"id": "P1", "name": "edocta.pdf", "contentType": "application/pdf", "size": 1000},
+            {"id": "X1", "name": "logo.png", "contentType": "image/png", "size": 100}]},
+        "/me/messages/AAA/attachments/P1": {
+            "contentBytes": base64.b64encode(_pdf_bytes("RFC123")).decode()},
+    })
+    email = g.get(ID_PREFIX + "AAA", ["RFC123"])
+    assert email.id == ID_PREFIX + "AAA" and email.internal_date == "2026-11-20"
+    assert "Saldo: $5,000.00" in email.body and email.sender == "Banco <edocta@banco.mx>"
+    assert [n for n, _ in email.pdfs] == ["edocta.pdf"]
+    assert not any("X1" in u for u, _ in g.requested)
+
+
+def test_two_mailboxes_track_first_sync_separately(db):
+    other = {"tipo": "otro", "institucion": None, "cuenta": None, "movimientos": [],
+             "estado_de_cuenta": None}
+    gmail = FakeGmail([make_email("g1")])
+    outlook = FakeGmail([make_email(ID_PREFIX + "o1")])
+    outlook.name = "outlook"
+    client = FakeClient([other, other])
+    asyncio.run(sync_mailbox(db, gmail, client, []))
+    asyncio.run(sync_mailbox(db, outlook, client, []))
+    assert gmail.queries == ["newer_than:60d"] and outlook.queries == ["newer_than:60d"]
+    assert db.is_email_processed(ID_PREFIX + "o1") and db.is_email_processed("g1")

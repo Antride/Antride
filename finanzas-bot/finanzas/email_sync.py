@@ -19,12 +19,23 @@ import anthropic
 
 from .agent import MODEL
 from .db import FinanceDB
-from .gmail_client import DEFAULT_QUERY, EmailMessage, GmailClient, sender_address
+from typing import Protocol
+
+from .gmail_client import EmailMessage, sender_address
 from .tools import SUGGESTED_CATEGORIES
 
 log = logging.getLogger(__name__)
 
 MAX_EMAILS_PER_RUN = 40
+
+
+class MailSource(Protocol):
+    """Un buzón de correo (Gmail, Outlook...)."""
+    name: str
+
+    def find_new(self, lookback_days: int, query: str | None, max_results: int) -> list[str]: ...
+
+    def get(self, message_id: str, pdf_passwords: list[str]) -> EmailMessage: ...
 
 _NULLABLE_STR = {"anyOf": [{"type": "string"}, {"type": "null"}]}
 _NULLABLE_NUM = {"anyOf": [{"type": "number"}, {"type": "null"}]}
@@ -208,22 +219,23 @@ def apply_extraction(db: FinanceDB, email: EmailMessage, data: dict) -> SyncEven
 
 async def sync_mailbox(
     db: FinanceDB,
-    gmail: GmailClient,
+    source: MailSource,
     client: anthropic.AsyncAnthropic,
     pdf_passwords: list[str],
     query: str | None = None,
     first_lookback_days: int = 60,
 ) -> list[SyncEvent]:
-    """Procesa los correos nuevos. La primera vez revisa los últimos `first_lookback_days`."""
-    first = db.get_setting("gmail_ya_sincronizado") is None
+    """Procesa los correos nuevos de un buzón. La primera vez revisa los últimos
+    `first_lookback_days` días; después, solo los últimos 4."""
+    done_key = f"{source.name}_ya_sincronizado"
+    first = db.get_setting(done_key) is None
     lookback = first_lookback_days if first else 4
-    q = f"({query or DEFAULT_QUERY}) newer_than:{lookback}d"
 
-    ids = await asyncio.to_thread(gmail.search, q, 200 if first else 50)
+    ids = await asyncio.to_thread(source.find_new, lookback, query, 200 if first else 50)
     pending = [i for i in ids if not db.is_email_processed(i)][:MAX_EMAILS_PER_RUN]
     events: list[SyncEvent] = []
     for msg_id in reversed(pending):  # del más antiguo al más nuevo
-        email = await asyncio.to_thread(gmail.get, msg_id, pdf_passwords)
+        email = await asyncio.to_thread(source.get, msg_id, pdf_passwords)
         try:
             data = await extract(client, email)
         except anthropic.APIError:
@@ -238,5 +250,5 @@ async def sync_mailbox(
             events.append(event)
     # Solo se marca la primera sincronización como hecha cuando ya no quedan pendientes.
     if first and len(pending) < MAX_EMAILS_PER_RUN:
-        db.set_setting("gmail_ya_sincronizado", date.today().isoformat())
+        db.set_setting(done_key, date.today().isoformat())
     return events
